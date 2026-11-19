@@ -35,10 +35,77 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
+
+CHECK = "second_opinion"
+
+
+def _name(ds, c):
+    return ds.classes[c] if 0 <= c < len(ds.classes) else str(c)
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    sc = cfg["second_opinion"]
+    conf_t, min_area, fp_conf = sc["conf"], sc["min_area_px"], sc["fp_conf"]
+    iou_missing, iou_match, iou_loose = sc["iou_missing"], sc["iou_match"], sc["iou_loose"]
+    n_cls = len(ds.classes)
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    issues = []
+    for img in ds.image_files():
+        stem = img.stem
+        if stem not in preds:
+            continue
+        raw_lines = ds.read_label_lines(stem)          # giữ số dòng gốc; None = không có file nhãn
+        if raw_lines is None:
+            continue
+        labels = []                                    # (số dòng, lớp, (cx, cy, w, h)) — chỉ dòng hợp lệ
+        for ln, text in raw_lines:
+            try:
+                c, x, y, w, h = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= c < n_cls:
+                labels.append((ln, c, (x, y, w, h)))
+        size = ds.image_size(stem)
+        W, H = size if size else (0, 0)
+        rows = preds[stem] or []
+
+        # --- từng dự đoán đủ tin cậy + đủ lớn: tối đa MỘT issue
+        for r in rows:
+            pc, conf, box = int(r[0]), float(r[1]), tuple(r[2:6])
+            if conf < conf_t or box[2] * W * box[3] * H < min_area:
+                continue
+            cands = [(iou_xywh(box, lb), lc) for _, lc, lb in labels]
+            cands = [(iou, lc) for iou, lc in cands if iou >= iou_missing]
+            if not cands:
+                issues.append(Issue(CHECK, WARN, "POSSIBLE_MISSING", stem,
+                                    f"model thấy {_name(ds, pc)} (conf {conf:.2f}) mà nhãn không có box",
+                                    extra={"conf": conf, "cls": pc, "box": list(box)}))
+                continue
+            same = [iou for iou, lc in cands if lc == pc]
+            if same:
+                best = max(same)
+                if best < iou_loose:
+                    issues.append(Issue(CHECK, WARN, "POSSIBLE_LOOSE_BOX", stem,
+                                        f"box {_name(ds, pc)} lỏng/lệch: IoU {best:.2f} < {iou_loose}",
+                                        extra={"conf": conf, "iou": round(best, 4), "cls": pc}))
+                continue                               # nhãn đúng lớp đã phủ vật này
+            best_iou, best_cls = max(cands)
+            if best_iou >= iou_match:
+                issues.append(Issue(CHECK, WARN, "POSSIBLE_WRONG_CLASS", stem,
+                                    f"nhãn {_name(ds, best_cls)} nhưng model nói {_name(ds, pc)} (conf {conf:.2f}, IoU {best_iou:.2f})",
+                                    extra={"conf": conf, "iou": round(best_iou, 4), "label_cls": best_cls, "pred_cls": pc}))
+            # khác lớp và IoU trong [iou_missing, iou_match): mơ hồ -> không cờ
+
+        # --- từng dòng nhãn: không khớp dự đoán nào (conf >= fp_conf, không lọc diện tích)
+        fp_boxes = [tuple(r[2:6]) for r in rows if float(r[1]) >= fp_conf]
+        for ln, lc, lb in labels:
+            best = max((iou_xywh(lb, pb) for pb in fp_boxes), default=0.0)
+            if best < iou_missing:
+                issues.append(Issue(CHECK, WARN, "POSSIBLE_FALSE_POS", stem,
+                                    f"box nhãn {_name(ds, lc)} không khớp vật nào model thấy (IoU tốt nhất {best:.2f})",
+                                    line=ln, extra={"iou": round(best, 4)}))
+    return issues
